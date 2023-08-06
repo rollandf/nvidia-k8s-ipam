@@ -21,7 +21,6 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -40,12 +39,12 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	ipamv1alpha1 "github.com/Mellanox/nvidia-k8s-ipam/api/v1alpha1"
 	"github.com/Mellanox/nvidia-k8s-ipam/cmd/ipam-controller/app/options"
 	"github.com/Mellanox/nvidia-k8s-ipam/pkg/common"
 	"github.com/Mellanox/nvidia-k8s-ipam/pkg/ipam-controller/allocator"
-	configmapctrl "github.com/Mellanox/nvidia-k8s-ipam/pkg/ipam-controller/controllers/configmap"
 	nodectrl "github.com/Mellanox/nvidia-k8s-ipam/pkg/ipam-controller/controllers/node"
-	"github.com/Mellanox/nvidia-k8s-ipam/pkg/ipam-controller/selector"
+	poolctrl "github.com/Mellanox/nvidia-k8s-ipam/pkg/ipam-controller/controllers/pool"
 	"github.com/Mellanox/nvidia-k8s-ipam/pkg/version"
 )
 
@@ -99,7 +98,7 @@ func RunController(ctx context.Context, config *rest.Config, opts *options.Optio
 
 	logger.Info("start IPAM controller",
 		"version", version.GetVersionString(), "config", opts.ConfigMapName,
-		"configNamespace", opts.ConfigMapNamespace)
+		"configNamespace", opts.ConfigMapNamespace, "poolsNamespace", opts.PoolsNamespace)
 
 	scheme := runtime.NewScheme()
 
@@ -108,13 +107,17 @@ func RunController(ctx context.Context, config *rest.Config, opts *options.Optio
 		return err
 	}
 
+	if err := ipamv1alpha1.AddToScheme(scheme); err != nil {
+		logger.Error(err, "failed to register ipamv1alpha1 scheme")
+		return err
+	}
+
 	mgr, err := ctrl.NewManager(config, ctrl.Options{
 		Scheme: scheme,
 		NewCache: cache.BuilderWithOptions(cache.Options{
-			SelectorsByObject: cache.SelectorsByObject{&corev1.ConfigMap{}: cache.ObjectSelector{
+			SelectorsByObject: cache.SelectorsByObject{&ipamv1alpha1.IPPool{}: cache.ObjectSelector{
 				Field: fields.AndSelectors(
-					fields.ParseSelectorOrDie(fmt.Sprintf("metadata.name=%s", opts.ConfigMapName)),
-					fields.ParseSelectorOrDie(fmt.Sprintf("metadata.namespace=%s", opts.ConfigMapNamespace))),
+					fields.ParseSelectorOrDie(fmt.Sprintf("metadata.namespace=%s", opts.PoolsNamespace))),
 			}},
 		}),
 		MetricsBindAddress:            opts.MetricsAddr,
@@ -132,30 +135,27 @@ func RunController(ctx context.Context, config *rest.Config, opts *options.Optio
 	}
 
 	netAllocator := allocator.New()
-	nodeSelector := selector.New()
-	configEventCH := make(chan event.GenericEvent, 1)
+	nodeEventCH := make(chan event.GenericEvent, 1)
 
 	if err = (&nodectrl.NodeReconciler{
-		Allocator:     netAllocator,
-		Selector:      nodeSelector,
-		ConfigEventCh: configEventCH,
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
+		Allocator:      netAllocator,
+		NodeEventCh:    nodeEventCH,
+		PoolsNamespace: opts.PoolsNamespace,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		logger.Error(err, "unable to create controller", "controller", "Node")
 		return err
 	}
 
-	if err = (&configmapctrl.ConfigMapReconciler{
-		Allocator:          netAllocator,
-		Selector:           nodeSelector,
-		ConfigEventCh:      configEventCH,
-		ConfigMapName:      opts.ConfigMapName,
-		ConfigMapNamespace: opts.ConfigMapNamespace,
-		Client:             mgr.GetClient(),
-		Scheme:             mgr.GetScheme(),
+	if err = (&poolctrl.PoolReconciler{
+		Allocator:      netAllocator,
+		NodeEventCh:    nodeEventCH,
+		PoolsNamespace: opts.PoolsNamespace,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
-		logger.Error(err, "unable to create controller", "controller", "ConfigMap")
+		logger.Error(err, "unable to create controller", "controller", "IPPool")
 		return err
 	}
 

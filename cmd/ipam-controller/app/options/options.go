@@ -32,6 +32,7 @@ func New() *Options {
 		LeaderElectionNamespace: "kube-system",
 		ConfigMapName:           "nvidia-k8s-ipam-config",
 		ConfigMapNamespace:      "kube-system",
+		PoolsNamespace:          "kube-system",
 	}
 }
 
@@ -44,6 +45,7 @@ type Options struct {
 	LeaderElectionNamespace string
 	ConfigMapName           string
 	ConfigMapNamespace      string
+	PoolsNamespace          string
 }
 
 // AddNamedFlagSets register flags for common options in NamedFlagSets
@@ -70,6 +72,8 @@ func (o *Options) AddNamedFlagSets(sharedFS *cliflag.NamedFlagSets) {
 		o.ConfigMapName, "The name of the ConfigMap which holds controller configuration")
 	controllerFS.StringVar(&o.ConfigMapNamespace, "config-namespace",
 		o.ConfigMapNamespace, "The name of the namespace where ConfigMap with controller configuration exist")
+	controllerFS.StringVar(&o.PoolsNamespace, "ippools-namespace",
+		o.PoolsNamespace, "The name of the namespace to watch for IPPools CRs")
 }
 
 // Validate registered options

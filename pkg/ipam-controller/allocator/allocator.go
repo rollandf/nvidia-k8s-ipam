@@ -15,7 +15,6 @@ package allocator
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -29,6 +28,8 @@ import (
 
 	"github.com/Mellanox/nvidia-k8s-ipam/pkg/ip"
 	"github.com/Mellanox/nvidia-k8s-ipam/pkg/pool"
+
+	ipamv1alpha1 "github.com/Mellanox/nvidia-k8s-ipam/api/v1alpha1"
 )
 
 var ErrNoFreeRanges = errors.New("no free IP ranges available")
@@ -141,6 +142,11 @@ func (pa *poolAllocator) Load(ctx context.Context, allocData nodeAllocationInfo)
 		log.Info("range check failed", "reason", err.Error())
 		return err
 	}
+	a, ok := pa.allocations[allocData.Node]
+	if ok && allocData.allocatedRange.StartIP.Equal(a.StartIP) {
+		// Node Allocation already exists and is the same
+		return nil
+	}
 	allocations := pa.getAllocationsAsSlice()
 	for _, a := range allocations {
 		// range size is always the same, then an overlap means the blocks are necessarily equal.
@@ -200,6 +206,7 @@ type AllocationConfig struct {
 	Subnet           *net.IPNet
 	Gateway          net.IP
 	PerNodeBlockSize int
+	NodeSelector     *corev1.NodeSelector
 }
 
 func (pc *AllocationConfig) Equal(other *AllocationConfig) bool {
@@ -214,82 +221,70 @@ func New() *Allocator {
 type Allocator struct {
 	lock       sync.Mutex
 	allocators map[string]*poolAllocator
-	configured bool
 }
 
-// IsConfigured returns true if allocator is configured
-func (a *Allocator) IsConfigured() bool {
+// IsPoolLoaded returns true if allocator is configured
+func (a *Allocator) IsPoolLoaded(poolName string) bool {
 	a.lock.Lock()
 	defer a.lock.Unlock()
-	return a.configured
+	_, exist := a.allocators[poolName]
+	return exist
 }
 
 // Configure update allocator configuration
-func (a *Allocator) Configure(ctx context.Context, configs []AllocationConfig) {
+func (a *Allocator) Configure(ctx context.Context, config AllocationConfig) {
 	a.lock.Lock()
 	defer a.lock.Unlock()
-	a.configure(ctx, configs)
+	a.configureSinglePool(ctx, config)
 }
 
 // ConfigureAndLoadAllocations configures allocator and load data from the node objects
-func (a *Allocator) ConfigureAndLoadAllocations(ctx context.Context, configs []AllocationConfig, nodes []corev1.Node) {
+func (a *Allocator) ConfigureAndLoadAllocations(ctx context.Context, config AllocationConfig, p *ipamv1alpha1.IPPool) {
 	log := logr.FromContextOrDiscard(ctx)
 	a.lock.Lock()
 	defer a.lock.Unlock()
-	a.configure(ctx, configs)
-	for i := range nodes {
-		node := nodes[i]
-		nodeLog := log.WithValues("node", node.Name)
-		poolCfg, err := pool.NewConfigReader(&node)
+	a.configureSinglePool(ctx, config)
+	poolData := a.allocators[config.PoolName]
+	for i := range p.Status.Allocations {
+		alloc := p.Status.Allocations[i]
+		p := &pool.IPPool{
+			Name:    p.Name,
+			Subnet:  p.Spec.Subnet,
+			Gateway: p.Spec.Gateway,
+			StartIP: alloc.StartIP,
+			EndIP:   alloc.EndIP,
+		}
+		allocInfo, err := ipPoolConfigToNodeAllocationInfo(alloc.NodeName, p)
+		logErr := func(err error) {
+			log.Info("ignore allocation info from node", "node", alloc.NodeName,
+				"pool", p.Name, "reason", err.Error())
+		}
 		if err != nil {
-			nodeLog.Info("skip loading data from the node", "reason", err.Error())
+			logErr(err)
 			continue
 		}
-		// load allocators only for know pools (pools which are defined in the config)
-		for poolName, poolData := range a.allocators {
-			nodeIPPoolConfig := poolCfg.GetPoolByName(poolName)
-			allocInfo, err := ipPoolConfigToNodeAllocationInfo(node.Name, nodeIPPoolConfig)
-			logErr := func(err error) {
-				nodeLog.Info("ignore allocation info from node",
-					"pool", poolName, "reason", err.Error())
-			}
-			if err != nil {
-				logErr(err)
-				continue
-			}
-
-			if err := poolData.Load(ctx, allocInfo); err != nil {
-				logErr(err)
-				continue
-			}
-			a.allocators[poolName] = poolData
+		if err := poolData.Load(ctx, allocInfo); err != nil {
+			logErr(err)
+			continue
 		}
 	}
-	a.configured = true
 }
 
-// Allocate allocates ranges for node from all pools
-func (a *Allocator) Allocate(ctx context.Context, nodeName string) (map[string]*pool.IPPool, error) {
-	log := logr.FromContextOrDiscard(ctx).WithValues("node", nodeName)
+// AllocateFromPool allocates ranges for node from specific pool
+func (a *Allocator) AllocateFromPool(ctx context.Context, poolName string, nodeName string) (*pool.IPPool, error) {
 	a.lock.Lock()
 	defer a.lock.Unlock()
 
-	nodeAllocations := make(map[string]*pool.IPPool, len(a.allocators))
-	for poolName, allocator := range a.allocators {
-		allocation, err := allocator.Allocate(ctx, nodeName)
-		if err != nil {
-			a.deallocate(ctx, nodeName)
-			return nil, err
-		}
-		nodeAllocations[poolName] = nodeAllocationInfoToIPPoolConfig(poolName, allocation)
+	allocator, ok := a.allocators[poolName]
+	if !ok {
+		return nil, fmt.Errorf("fail to allocate, pool %s does not exists", poolName)
 	}
-
-	if log.V(1).Enabled() {
-		//nolint:errchkjson
-		dump, _ := json.Marshal(nodeAllocations)
-		log.V(1).Info("allocated ranges", "ranges", dump)
+	allocation, err := allocator.Allocate(ctx, nodeName)
+	if err != nil {
+		a.deallocate(ctx, nodeName)
+		return nil, err
 	}
-	return nodeAllocations, nil
+	return nodeAllocationInfoToIPPoolConfig(poolName, allocation), nil
 }
 
 func (a *Allocator) deallocate(ctx context.Context, nodeName string) {
@@ -305,32 +300,36 @@ func (a *Allocator) Deallocate(ctx context.Context, nodeName string) {
 	a.deallocate(ctx, nodeName)
 }
 
-func (a *Allocator) configure(ctx context.Context, configs []AllocationConfig) {
-	log := logr.FromContextOrDiscard(ctx)
-	for _, cfg := range configs {
-		poolLog := log.WithValues("pool", cfg.PoolName,
-			"gateway", cfg.Gateway.String(), "subnet", cfg.Subnet.String(), "perNodeBlockSize", cfg.PerNodeBlockSize)
-		pAlloc, exist := a.allocators[cfg.PoolName]
-		if exist {
-			poolLog.Info("update IP pool allocator config")
-			pAlloc.Configure(ctx, cfg)
-		} else {
-			poolLog.Info("initialize IP pool allocator")
-			a.allocators[cfg.PoolName] = newPoolAllocator(cfg)
-		}
+// DeallocateFromPool release all ranges allocated for node on specific pool
+func (a *Allocator) DeallocateFromPool(ctx context.Context, poolName string, nodeName string) {
+	a.lock.Lock()
+	defer a.lock.Unlock()
+	pAlloc, exist := a.allocators[poolName]
+	if exist {
+		pAlloc.Deallocate(ctx, nodeName)
 	}
-	// remove outdated pools from controller state
-	for poolName := range a.allocators {
-		found := false
-		for _, cfg := range configs {
-			if poolName == cfg.PoolName {
-				found = true
-				break
-			}
-		}
-		if !found {
-			delete(a.allocators, poolName)
-		}
+}
+
+// RemovePool from Allocator
+func (a *Allocator) RemovePool(ctx context.Context, poolName string) {
+	log := logr.FromContextOrDiscard(ctx)
+	a.lock.Lock()
+	defer a.lock.Unlock()
+	log.Info("remove IP Pool", "pool", poolName)
+	delete(a.allocators, poolName)
+}
+
+func (a *Allocator) configureSinglePool(ctx context.Context, cfg AllocationConfig) {
+	log := logr.FromContextOrDiscard(ctx)
+	poolLog := log.WithValues("pool", cfg.PoolName,
+		"gateway", cfg.Gateway.String(), "subnet", cfg.Subnet.String(), "perNodeBlockSize", cfg.PerNodeBlockSize)
+	pAlloc, exist := a.allocators[cfg.PoolName]
+	if exist {
+		poolLog.Info("update IP pool allocator config")
+		pAlloc.Configure(ctx, cfg)
+	} else {
+		poolLog.Info("initialize IP pool allocator")
+		a.allocators[cfg.PoolName] = newPoolAllocator(cfg)
 	}
 }
 

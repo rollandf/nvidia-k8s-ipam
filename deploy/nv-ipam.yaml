@@ -136,6 +136,22 @@ rules:
       - list
       - watch
   - apiGroups:
+      - nv-ipam.nvidia.com
+    resources:
+      - ippools
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - nv-ipam.nvidia.com
+    resources:
+      - ippools/status
+    verbs:
+      - get
+      - update
+      - patch
+  - apiGroups:
       - coordination.k8s.io
     resources:
       - leases
@@ -244,6 +260,7 @@ spec:
             - --config-namespace=$(POD_NAMESPACE)
             - --leader-elect=true
             - --leader-elect-namespace=$(POD_NAMESPACE)
+            - --ippools-namespace=$(POD_NAMESPACE)
           env:
             - name: POD_NAMESPACE
               valueFrom:
