@@ -18,6 +18,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 
@@ -45,6 +47,7 @@ import (
 	"github.com/Mellanox/nvidia-k8s-ipam/pkg/ipam-controller/allocator"
 	nodectrl "github.com/Mellanox/nvidia-k8s-ipam/pkg/ipam-controller/controllers/node"
 	poolctrl "github.com/Mellanox/nvidia-k8s-ipam/pkg/ipam-controller/controllers/pool"
+	"github.com/Mellanox/nvidia-k8s-ipam/pkg/ipam-controller/migrator"
 	"github.com/Mellanox/nvidia-k8s-ipam/pkg/version"
 )
 
@@ -131,6 +134,20 @@ func RunController(ctx context.Context, config *rest.Config, opts *options.Optio
 
 	if err != nil {
 		logger.Error(err, "unable to start manager")
+		return err
+	}
+
+	directClient, err := client.New(config,
+		client.Options{Scheme: mgr.GetScheme(), Mapper: mgr.GetRESTMapper()})
+	if err != nil {
+		logger.Error(err, "failed to create direct client")
+		os.Exit(1)
+	}
+
+	if err := migrator.Migrate(ctx, directClient, opts.ConfigMapName,
+		opts.ConfigMapNamespace, opts.PoolsNamespace); err != nil {
+		logger.Error(err, fmt.Sprintf("failed to migrate NV-IPAM config from ConfigMap, "+
+			"set %s env variable to disable migration", migrator.EnvDisableMigration))
 		return err
 	}
 
